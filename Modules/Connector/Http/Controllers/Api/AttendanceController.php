@@ -3,10 +3,12 @@
 namespace Modules\Connector\Http\Controllers\Api;
 
 use App\Business;
+use App\User;
 use App\Utils\ModuleUtil;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Auth;
+use Modules\Essentials\Utils\EssentialsUtil;
 use Modules\Connector\Transformers\CommonResource;
 
 /**
@@ -67,6 +69,54 @@ class AttendanceController extends ApiController
                                     ->first();
 
         return new CommonResource($attendance);
+    }
+
+    /**
+     * Attendance calendar for a month (summary + days grid).
+     *
+     * @queryParam year integer required Example: 2025
+     * @queryParam month integer required 1..12 Example: 10
+     * @queryParam user_id integer Optional; defaults to the authenticated user. Non-admins may only query themselves.
+     *
+     * @responseField data.attended Count of on-time workdays in the month.
+     * @responseField data.late Count of late arrivals.
+     * @responseField data.absent Workdays without clock-in (past/today only).
+     * @responseField data.weekend Weekend days per shift configuration (default Fri/Sat).
+     */
+    public function getAttendanceByDate(Request $request)
+    {
+        if (! $this->moduleUtil->isModuleInstalled('Essentials')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $request->validate([
+            'year' => 'required|integer',
+            'month' => 'required|integer|min:1|max:12',
+            'user_id' => 'nullable|integer',
+        ]);
+
+        $auth = Auth::user();
+        $business_id = $auth->business_id;
+        $user_id = (int) ($request->input('user_id') ?: $auth->id);
+
+        $employee = User::where('business_id', $business_id)->where('id', $user_id)->first();
+        if (empty($employee)) {
+            abort(404, 'User not found.');
+        }
+
+        if ($user_id !== (int) $auth->id && ! $auth->can('superadmin') && ! $this->moduleUtil->is_admin($auth, $business_id)) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $data = (new EssentialsUtil())->getAttendanceByDateForApi(
+            $business_id,
+            $user_id,
+            (int) $request->input('year'),
+            (int) $request->input('month'),
+            $auth
+        );
+
+        return $this->respond(['data' => $data]);
     }
 
     /**

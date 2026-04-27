@@ -2,8 +2,10 @@
 
 namespace Modules\Essentials\Utils;
 
+use App\Business;
 use App\Transaction;
 use App\Utils\Util;
+use Carbon\Carbon;
 use DB;
 use Illuminate\Support\Facades\View;
 use Modules\Essentials\Entities\EssentialsAllowanceAndDeduction;
@@ -386,5 +388,307 @@ class EssentialsUtil extends Util
             }
 
             return $holidays;
+    }
+
+    /**
+     * Monthly attendance calendar + summary for Connector API (getAttendanceByDate).
+     *
+     * Day status codes: 1 attended (on time), 2 late, 4 absent/workday without punch,
+     * 5 vacation (approved leave), 6 weekend (per shift), 7 public holiday.
+     *
+     * @param  int  $business_id
+     * @param  int  $user_id
+     * @param  int  $year
+     * @param  int  $month
+     * @param  \App\User|null  $authUser  Used for holiday location filtering (optional).
+     */
+    public function getAttendanceByDateForApi($business_id, $user_id, $year, $month, $authUser = null)
+    {
+        $monthStart = Carbon::createFromDate((int) $year, (int) $month, 1)->startOfDay();
+        $monthEnd = $monthStart->copy()->endOfMonth();
+
+        $paddingStart = $monthStart->copy()->subDays(7);
+        $paddingEnd = $monthEnd->copy()->addDays(7);
+
+        $settings = [];
+        $business = Business::find($business_id);
+        if (! empty($business->essentials_settings)) {
+            $settings = json_decode($business->essentials_settings, true) ?: [];
+        }
+
+        $graceAfterCheckin = ! empty($settings['grace_after_checkin']) ? (int) $settings['grace_after_checkin'] : 0;
+
+        $attendanceRows = EssentialsAttendance::where('business_id', $business_id)
+            ->where('user_id', $user_id)
+            ->whereDate('clock_in_time', '>=', $paddingStart->format('Y-m-d'))
+            ->whereDate('clock_in_time', '<=', $paddingEnd->format('Y-m-d'))
+            ->orderBy('clock_in_time')
+            ->get()
+            ->groupBy(function ($row) {
+                return Carbon::parse($row->clock_in_time)->format('Y-m-d');
+            });
+
+        $summary = [
+            'attended' => 0,
+            'late' => 0,
+            'absent' => 0,
+            'out' => 0,
+            'vacation' => 0,
+            'weekend' => 0,
+            'no_clockout' => 0,
+            'total_late_minutes' => 0,
+            'total_overtime_minutes' => 0,
+            'month_name' => $monthStart->format('F'),
+        ];
+
+        $days = [];
+        $cursor = $monthStart->copy();
+        while ($cursor->lte($monthEnd)) {
+            $dayRow = $this->buildAttendanceApiDay(
+                $cursor,
+                $business_id,
+                $user_id,
+                $attendanceRows,
+                $graceAfterCheckin,
+                $authUser,
+                true
+            );
+            $days[] = $dayRow['payload'];
+            foreach ($dayRow['counters'] as $key => $delta) {
+                if ($key === 'total_late_minutes' || $key === 'total_overtime_minutes') {
+                    $summary[$key] += $delta;
+                } elseif (array_key_exists($key, $summary)) {
+                    $summary[$key] += $delta;
+                }
+            }
+            $cursor->addDay();
+        }
+
+        $days_before = [];
+        $b = $monthStart->copy()->subDays(7);
+        for ($i = 0; $i < 7; $i++) {
+            $row = $this->buildAttendanceApiDay(
+                $b,
+                $business_id,
+                $user_id,
+                $attendanceRows,
+                $graceAfterCheckin,
+                $authUser,
+                false
+            );
+            $days_before[] = $row['payload'];
+            $b->addDay();
+        }
+
+        $days_after = [];
+        $a = $monthEnd->copy()->addDay();
+        for ($i = 0; $i < 7; $i++) {
+            $row = $this->buildAttendanceApiDay(
+                $a,
+                $business_id,
+                $user_id,
+                $attendanceRows,
+                $graceAfterCheckin,
+                $authUser,
+                false
+            );
+            $days_after[] = $row['payload'];
+            $a->addDay();
+        }
+
+        return array_merge($summary, [
+            'days_before' => $days_before,
+            'days' => $days,
+            'days_after' => $days_after,
+        ]);
+    }
+
+    /**
+     * @param  \Illuminate\Support\Collection|null  $attendanceRows  keyed by Y-m-d
+     */
+    protected function buildAttendanceApiDay(
+        Carbon $date,
+        $business_id,
+        $user_id,
+        $attendanceRows,
+        int $graceAfterCheckin,
+        $authUser,
+        bool $countTowardSummary
+    ) {
+        $dateStr = $date->format('Y-m-d');
+        $number_in_week = (int) $date->format('w') + 1;
+
+        $shift = $this->getShiftForUserOnDate($business_id, $user_id, $date);
+        $isWeekend = $this->isOffDayFromShift($date, $shift);
+        $isPublicHoliday = $this->isPublicHolidayOnDate($business_id, $dateStr, $authUser);
+        $isVacation = $this->isApprovedLeaveOnDate($business_id, $user_id, $dateStr);
+
+        /** @var \Illuminate\Support\Collection|null $dayAttendances */
+        $dayAttendances = $attendanceRows->get($dateStr);
+        $attendance = $dayAttendances && $dayAttendances->count() ? $dayAttendances->first() : null;
+
+        $status = 4;
+        $lateMinutes = 0;
+        $overtimeMinutes = 0;
+        $startTime = null;
+        $endTime = null;
+        $clockInNote = '';
+
+        $counters = [
+            'attended' => 0,
+            'late' => 0,
+            'absent' => 0,
+            'out' => 0,
+            'vacation' => 0,
+            'weekend' => 0,
+            'no_clockout' => 0,
+            'total_late_minutes' => 0,
+            'total_overtime_minutes' => 0,
+        ];
+
+        if ($isPublicHoliday) {
+            $status = 7;
+        } elseif ($isVacation) {
+            $status = 5;
+            if ($countTowardSummary) {
+                $counters['vacation'] = 1;
+            }
+        } elseif ($isWeekend) {
+            $status = 6;
+            if ($countTowardSummary) {
+                $counters['weekend'] = 1;
+            }
+        } elseif (! empty($attendance)) {
+            $clockInNote = (string) ($attendance->clock_in_note ?? '');
+            $startTime = $attendance->clock_in_time ? Carbon::parse($attendance->clock_in_time)->format('Y-m-d H:i:s') : null;
+            $endTime = $attendance->clock_out_time ? Carbon::parse($attendance->clock_out_time)->format('Y-m-d H:i:s') : null;
+
+            if (empty($attendance->clock_out_time) && $countTowardSummary) {
+                $counters['no_clockout'] = 1;
+            }
+
+            if ($shift && $shift->type === 'fixed_shift' && ! empty($shift->start_time)) {
+                $shiftStart = Carbon::parse($dateStr.' '.Carbon::parse($shift->start_time)->format('H:i:s'));
+                $clockInCarbon = Carbon::parse($attendance->clock_in_time);
+                $allowedUntil = $shiftStart->copy()->addMinutes($graceAfterCheckin);
+                if ($clockInCarbon->gt($allowedUntil)) {
+                    $lateMinutes = (int) $allowedUntil->diffInMinutes($clockInCarbon);
+                    $status = 2;
+                    if ($countTowardSummary) {
+                        $counters['late'] = 1;
+                        $counters['total_late_minutes'] = $lateMinutes;
+                    }
+                } else {
+                    $status = 1;
+                    if ($countTowardSummary) {
+                        $counters['attended'] = 1;
+                    }
+                }
+            } else {
+                $status = 1;
+                if ($countTowardSummary) {
+                    $counters['attended'] = 1;
+                }
+            }
+
+            if ($countTowardSummary && ! empty($attendance->clock_out_time) && $shift && $shift->type === 'fixed_shift' && ! empty($shift->end_time)) {
+                $shiftEnd = Carbon::parse($dateStr.' '.Carbon::parse($shift->end_time)->format('H:i:s'));
+                $clockOutCarbon = Carbon::parse($attendance->clock_out_time);
+                if ($clockOutCarbon->gt($shiftEnd)) {
+                    $overtimeMinutes = (int) $shiftEnd->diffInMinutes($clockOutCarbon);
+                    $counters['total_overtime_minutes'] = $overtimeMinutes;
+                }
+            }
+        } else {
+            $shouldCountAbsent = $countTowardSummary && ! $isWeekend && ! $isPublicHoliday && ! $isVacation && ! $date->isFuture();
+            if ($shouldCountAbsent) {
+                $status = 4;
+                $counters['absent'] = 1;
+            }
+        }
+
+        $payload = [
+            'number_in_month' => $date->day,
+            'number_in_week' => $number_in_week,
+            'month' => (int) $date->format('n'),
+            'year' => (int) $date->format('Y'),
+            'name' => $date->format('l'),
+            'status' => $status,
+            'clock_in_note' => $clockInNote,
+            'start_time' => $startTime,
+            'end_time' => $endTime,
+            'late_minutes' => $lateMinutes,
+            'overtime_minutes' => $overtimeMinutes,
+        ];
+
+        return ['payload' => $payload, 'counters' => $counters];
+    }
+
+    /**
+     * @return Shift|null
+     */
+    protected function getShiftForUserOnDate($business_id, $user_id, Carbon $date)
+    {
+        $dateStr = $date->format('Y-m-d');
+        $row = EssentialsUserShift::join('essentials_shifts as s', 's.id', '=', 'essentials_user_shifts.essentials_shift_id')
+            ->where('essentials_user_shifts.user_id', $user_id)
+            ->where('s.business_id', $business_id)
+            ->where(function ($q) use ($dateStr) {
+                $q->whereNull('essentials_user_shifts.start_date')
+                    ->orWhereDate('essentials_user_shifts.start_date', '<=', $dateStr);
+            })
+            ->where(function ($q) use ($dateStr) {
+                $q->whereNull('essentials_user_shifts.end_date')
+                    ->orWhereDate('essentials_user_shifts.end_date', '>=', $dateStr);
+            })
+            ->orderBy('essentials_user_shifts.id')
+            ->select('s.*')
+            ->first();
+
+        return $row ? Shift::find($row->id) : null;
+    }
+
+    protected function isOffDayFromShift(Carbon $date, $shift): bool
+    {
+        $dayString = strtolower($date->format('l'));
+        $weekendDays = ['friday', 'saturday'];
+        if ($shift && ! empty($shift->holidays)) {
+            $h = $shift->holidays;
+            $h = is_array($h) ? $h : json_decode((string) $h, true);
+            if (is_array($h) && count($h)) {
+                $weekendDays = array_map('strtolower', $h);
+            }
+        }
+
+        return in_array($dayString, $weekendDays, true);
+    }
+
+    protected function isPublicHolidayOnDate($business_id, $dateStr, $authUser): bool
+    {
+        $q = EssentialsHoliday::where('business_id', $business_id)
+            ->whereDate('start_date', '<=', $dateStr)
+            ->whereDate('end_date', '>=', $dateStr);
+
+        if ($authUser) {
+            $permitted = $authUser->permitted_locations($business_id);
+            if ($permitted != 'all') {
+                $q->where(function ($query) use ($permitted) {
+                    $query->whereIn('location_id', $permitted)
+                        ->orWhereNull('location_id');
+                });
+            }
+        }
+
+        return $q->exists();
+    }
+
+    protected function isApprovedLeaveOnDate($business_id, $user_id, $dateStr): bool
+    {
+        return EssentialsLeave::where('business_id', $business_id)
+            ->where('user_id', $user_id)
+            ->where('status', 'approved')
+            ->whereDate('start_date', '<=', $dateStr)
+            ->whereDate('end_date', '>=', $dateStr)
+            ->exists();
     }
 }
